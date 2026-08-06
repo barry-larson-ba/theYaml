@@ -16,3 +16,4 @@ htmlcov/
 # Local editor/assistant tooling config -- machine-specific, not project content
 .claude/
 CLAUDE.md
+.Rproj.user
