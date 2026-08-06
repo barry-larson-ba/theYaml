@@ -91,6 +91,13 @@ def test_bare_column_list_skips_checks_it_cannot_run():
     assert result.checks_run == ("column_names",)  # no types, no row count available
 
 
+def test_value_checks_are_skipped_when_there_is_no_data_to_read():
+    contract = parse_contract("columns:\n  - name: A\n    allowed_values: [P, C]\n")
+    result = validate(["A"], contract)
+    assert result.checks_run == ("column_names",)  # a name list carries no values
+    assert result.ok
+
+
 def test_unknown_check_name_is_rejected():
     with pytest.raises(KeyError, match="unknown check"):
         validate(["PRACT ID"], CONTRACT, checks=["not_a_check"])
@@ -102,8 +109,8 @@ def test_string_frame_gets_a_helpful_error():
 
 
 def test_contract_can_be_passed_as_a_name():
-    result = validate_columns(list(load_contract("expected_columns.yaml").column_names),
-                              "expected_columns.yaml")
+    result = validate_columns(list(load_contract("telemedicine.yaml").column_names),
+                              "telemedicine.yaml")
     assert result.ok
 
 
@@ -147,6 +154,79 @@ def test_pandas_row_count_assertion():
     result = validate(_frame(rows=1), CONTRACT, checks=["row_count"])
     assert not result.ok
     assert "row count 1 violates greater_than 2" in result.errors[0].message
+
+
+# --------------------------------------------------------------------------
+# allowed_values -- the site-status columns in the shipped contract
+# --------------------------------------------------------------------------
+
+SITE_CONTRACT = parse_contract(
+    "columns:\n"
+    "  - name: ANT\n"
+    "    type: string\n"
+    "    allowed_values: [\"P\", \"C\", \"T\", \" \"]\n"
+)
+
+
+def _sites(values):
+    return pd.DataFrame({"ANT": values})
+
+
+def test_allowed_site_statuses_pass():
+    result = validate(_sites(["P", "C", "T", " ", "P"]), SITE_CONTRACT, checks=["allowed_values"])
+    assert result.ok
+    assert result.issues == ()
+
+
+def test_a_value_outside_the_list_is_an_error():
+    result = validate(_sites(["P", "X", "C", "X"]), SITE_CONTRACT, checks=["allowed_values"])
+    assert not result.ok
+    issue = result.errors[0]
+    assert issue.column == "ANT"
+    assert "does not allow: 'X'" in issue.message
+    assert "allowed: 'P', 'C', 'T', ' '" in issue.message
+
+
+def test_case_and_padding_are_not_quietly_accepted():
+    result = validate(_sites(["p", "T ", ""]), SITE_CONTRACT, checks=["allowed_values"])
+    assert not result.ok
+    assert "3 value(s)" in result.errors[0].message
+
+
+def test_nulls_violate_a_constrained_column():
+    result = validate(_sites(["P", None, "C"]), SITE_CONTRACT, checks=["allowed_values"])
+    assert not result.ok
+    assert "does not allow: null" in result.errors[0].message
+
+
+def test_nulls_pass_when_the_contract_lists_null():
+    contract = parse_contract("columns:\n  - name: ANT\n    allowed_values: [P, null]\n")
+    assert validate(_sites(["P", None]), contract, checks=["allowed_values"]).ok
+
+
+def test_the_scan_is_capped_and_says_so():
+    result = validate(
+        _sites(["P", "C", "T"]), SITE_CONTRACT, checks=["allowed_values"], max_distinct_values=2
+    )
+    assert "only the first 2 distinct values" in result.warnings[0].message
+    assert result.ok  # truncation warns; it never invents a failure
+
+
+def test_a_missing_constrained_column_is_left_to_column_names():
+    result = validate(pd.DataFrame({"OTHER": ["P"]}), SITE_CONTRACT, checks=["allowed_values"])
+    assert result.issues == ()
+
+
+def test_the_shipped_contract_validates_a_clean_frame():
+    contract = load_contract("telemedicine.yaml")
+    frame = pd.DataFrame({name: ["P", "C", "T", " "] for name in contract.column_names})
+    result = validate(frame, contract, checks=["column_names", "allowed_values"])
+    assert result.ok, result.summary()
+
+    frame.loc[0, "SFO"] = "Z"
+    failed = validate(frame, contract, checks=["allowed_values"])
+    assert not failed.ok
+    assert failed.errors[0].column == "SFO"
 
 
 def test_result_records_are_flat_strings_for_spark():

@@ -2,7 +2,7 @@
 
     from dqspec import load_contract, validate_columns
 
-    contract = load_contract("expected_columns.yaml")
+    contract = load_contract("telemedicine.yaml")
     result = validate_columns(df, contract)
     print(result.summary())
     result.raise_if_failed()
@@ -13,6 +13,9 @@ installing this on a Databricks cluster cannot disturb the runtime.
 
 from .checks import REGISTRY, Options, register
 from .contract import (
+    CADENCES,
+    END_CLIENTS,
+    REPORT_TYPES,
     ColumnSpec,
     Contract,
     ContractError,
@@ -40,6 +43,9 @@ __all__ = [
     "Contract",
     "ColumnSpec",
     "ContractError",
+    "CADENCES",
+    "END_CLIENTS",
+    "REPORT_TYPES",
     "load_contract",
     "parse_contract",
     "packaged_contract_path",

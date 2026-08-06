@@ -7,7 +7,7 @@
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
-# MAGIC | **Contract** | `src/dqspec/contracts/expected_columns.yaml` |
+# MAGIC | **Contract** | `src/dqspec/contracts/telemedicine.yaml` |
 # MAGIC | **Dataset** | `practitioner_privileges` (built below; swap for your real table) |
 # MAGIC | **Runs on** | any cluster / SQL warehouse with Python — no libraries to install |
 # MAGIC
@@ -89,15 +89,18 @@ print("dqspec", dqspec.__version__, "loaded from", os.path.dirname(dqspec.__file
 # MAGIC steward edit contracts without a code deploy, pass an absolute path instead:
 # MAGIC
 # MAGIC ```python
-# MAGIC contract = load_contract("/Volumes/main/credentialing/contracts/expected_columns.yaml")
+# MAGIC contract = load_contract("/Volumes/main/credentialing/contracts/telemedicine.yaml")
 # MAGIC ```
 
 # COMMAND ----------
 
-contract = load_contract("expected_columns.yaml")
+contract = load_contract("telemedicine.yaml")
 
 print("title        :", contract.title)
 print("owner        :", contract.business_owner)
+print("cadence      :", contract.cadence)
+print("end client(s):", ", ".join(contract.end_clients) or "unstated")
+print("report type(s):", ", ".join(contract.report_types) or "unstated")
 print("source       :", contract.source)
 print("columns      :", len(contract.columns))
 print("assertions   :", dict(contract.assertions))
@@ -113,10 +116,18 @@ print("assertions   :", dict(contract.assertions))
 display(
     spark.createDataFrame(
         [
-            (i, c.name, c.type, c.required, c.description)
+            (
+                i,
+                c.name,
+                c.type,
+                c.required,
+                ", ".join(repr(v) for v in c.allowed_values) if c.allowed_values else None,
+                c.description,
+            )
             for i, c in enumerate(contract.columns)
         ],
-        "position int, column string, type string, required boolean, description string",
+        "position int, column string, type string, required boolean, "
+        "allowed_values string, description string",
     )
 )
 
@@ -126,7 +137,9 @@ display(
 # MAGIC ## 3. The dataset
 # MAGIC
 # MAGIC A practitioner-privileges roster: who they are, where they are credentialed, and
-# MAGIC a `Y`/`N` flag per facility.
+# MAGIC a telemedicine status code per site — `P`, `C`, `T`, or a single space where the
+# MAGIC practitioner does not cover that site. Those are exactly the four values the
+# MAGIC contract's `allowed_values` permits.
 # MAGIC
 # MAGIC **In real use, delete this cell and read your table:**
 # MAGIC
@@ -135,7 +148,8 @@ display(
 # MAGIC ```
 # MAGIC
 # MAGIC Note the contract drives the schema below — the split between identity fields and
-# MAGIC facility codes comes out of the YAML, not out of a second hardcoded list.
+# MAGIC site codes, and the status values themselves, come out of the YAML rather than a
+# MAGIC second hardcoded list.
 
 # COMMAND ----------
 
@@ -143,10 +157,15 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 
 IDENTITY_FIELDS = contract.column_names[:9]
-FACILITY_CODES = contract.column_names[9:]
+SITE_CODES = contract.column_names[9:]
+
+# Statuses come from the contract too, so the demo data cannot contradict it.
+SITE_STATUSES = tuple(v for v in contract.column(SITE_CODES[0]).allowed_values if v.strip())
+NO_COVERAGE = " "
 
 print("identity :", IDENTITY_FIELDS)
-print("facility :", FACILITY_CODES)
+print("sites    :", SITE_CODES)
+print("statuses :", SITE_STATUSES)
 
 # (id, last, first, mi, degree, primary facility, home priv 1, home priv 2, telemedicine, granted)
 PRACTITIONERS = [
@@ -166,8 +185,10 @@ PRACTITIONERS = [
 def to_row(index, practitioner):
     last, first, mi, degree, primary, priv1, priv2, tele, granted = practitioner
     identity = ("P{0:06d}".format(100000 + index), last, first, mi, degree, primary, priv1, priv2, tele)
-    held = set(granted.split())
-    return identity + tuple("Y" if code in held else "N" for code in FACILITY_CODES)
+    # Sites the practitioner covers get a status; the rest are blank, not null.
+    held = granted.split()
+    status = {code: SITE_STATUSES[i % len(SITE_STATUSES)] for i, code in enumerate(held)}
+    return identity + tuple(status.get(code, NO_COVERAGE) for code in SITE_CODES)
 
 
 schema = StructType([StructField(name, StringType(), True) for name in contract.column_names])
@@ -278,6 +299,11 @@ display(findings)
 
 audit = (
     findings.withColumn("contract", F.lit(contract.title))
+    # Stamping cadence, end client and report type is what makes the audit table
+    # groupable later: "which of our monthly QHP feeds to DMHC failed this quarter?"
+    .withColumn("cadence", F.lit(contract.cadence))
+    .withColumn("end_client", F.lit(", ".join(contract.end_clients) or None))
+    .withColumn("report_type", F.lit(", ".join(contract.report_types) or None))
     .withColumn("dataset", F.lit("practitioner_privileges"))
     .withColumn("validated_at", F.current_timestamp())
 )
@@ -310,13 +336,13 @@ def gate(frame, contract_name, dataset, strict=False):
     return outcome.raise_if_failed()
 
 
-gate(df, "expected_columns.yaml", dataset="practitioner_privileges")
+gate(df, "telemedicine.yaml", dataset="practitioner_privileges")
 print("\n-> contract satisfied, safe to continue")
 
 # COMMAND ----------
 
 try:
-    gate(drifted, "expected_columns.yaml", dataset="practitioner_privileges")
+    gate(drifted, "telemedicine.yaml", dataset="practitioner_privileges")
 except ValidationFailed as exc:
     print("\n-> pipeline stopped:", len(exc.result.errors), "error(s)")
 
@@ -326,8 +352,8 @@ except ValidationFailed as exc:
 # MAGIC ## 8. Everything else the contract declares
 # MAGIC
 # MAGIC With no `checks=` argument, `validate()` runs every check that applies to this
-# MAGIC frame *and* this contract — here that adds `column_types` and the `row_count`
-# MAGIC assertion already in the YAML:
+# MAGIC frame *and* this contract — here that adds `column_types`, `allowed_values` on the
+# MAGIC site columns, and the `row_count` assertion already in the YAML:
 # MAGIC
 # MAGIC ```yaml
 # MAGIC assertions:
@@ -336,8 +362,9 @@ except ValidationFailed as exc:
 # MAGIC     less_than: 1000000
 # MAGIC ```
 # MAGIC
-# MAGIC **`row_count` calls `df.count()`** — a real scan. Keep it out of hot paths on
-# MAGIC large tables with `checks=["column_names"]`, which is what `validate_columns` does.
+# MAGIC **`row_count` calls `df.count()` and `allowed_values` runs one `distinct()` per
+# MAGIC constrained column** — real scans. Keep them out of hot paths on large tables with
+# MAGIC `checks=["column_names"]`, which is what `validate_columns` does.
 
 # COMMAND ----------
 
@@ -353,12 +380,31 @@ print(validate(df.limit(40), contract, checks=["row_count"]).summary())
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### A status code that should not exist
+# MAGIC
+# MAGIC The site columns may only hold `P`, `C`, `T` or a blank. Anything else — a stray
+# MAGIC `Y` from an old export, a lowercase `p`, a null where a space belongs — is an
+# MAGIC error, and the message names the values it actually found:
+
+# COMMAND ----------
+
+bad_values = (
+    df.withColumn("SFO", F.when(F.col("SFO") == "P", F.lit("Y")).otherwise(F.col("SFO")))
+    .withColumn("OAK", F.when(F.col("OAK") == " ", F.lit(None)).otherwise(F.col("OAK")))
+)
+
+print(validate(bad_values, contract, checks=["allowed_values"]).summary())
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Where to go next
 # MAGIC
 # MAGIC 1. **Point it at a real table.** Replace the cell in section 3 with
 # MAGIC    `spark.table(...)` and see what the contract says about production data.
 # MAGIC 2. **Fill in `business_owner`** in the YAML. It is `TBD` today, and the whole
-# MAGIC    point of a contract is that someone owns it.
+# MAGIC    point of a contract is that someone owns it. Confirm `cadence`, `end_client`
+# MAGIC    and `report_type` with them while you are there — all three are placeholders.
 # MAGIC 3. **Add assertions.** `docs/EXPLAINER.md` §7 — a new rule is one function in
 # MAGIC    `src/dqspec/checks.py`, picked up by `validate()` automatically.
 # MAGIC 4. **Decide where contracts live.** In the package (reviewed via PR, shipped in

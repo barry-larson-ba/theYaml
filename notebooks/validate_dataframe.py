@@ -116,11 +116,14 @@ print("dqspec", dqspec.__version__)
 print("packaged contracts:", dqspec.list_packaged_contracts())
 
 # A bare name resolves to the YAML shipped inside the package. You can also pass an
-# absolute path, e.g. "/Volumes/main/default/contracts/expected_columns.yaml".
-contract = load_contract("expected_columns.yaml")
+# absolute path, e.g. "/Volumes/main/default/contracts/telemedicine.yaml".
+contract = load_contract("telemedicine.yaml")
 
 print(contract)
 print("owner:", contract.business_owner)
+print("cadence:", contract.cadence)
+print("end client(s):", contract.end_clients)
+print("report type(s):", contract.report_types)
 print("columns:", contract.column_names)
 print("assertions:", dict(contract.assertions))
 
@@ -140,7 +143,12 @@ print("assertions:", dict(contract.assertions))
 from pyspark.sql.types import StringType, StructField, StructType
 
 schema = StructType([StructField(name, StringType(), True) for name in contract.column_names])
-row = tuple("x" for _ in contract.column_names)
+
+# The site columns are constrained to P/C/T/blank by the contract, so the demo row
+# takes its value from the contract rather than making one up.
+row = tuple(
+    (spec.allowed_values[0] if spec.allowed_values else "x") for spec in contract.columns
+)
 
 df = spark.createDataFrame([row] * 150, schema)
 display(df.limit(5))
@@ -213,9 +221,10 @@ display(findings)
 # MAGIC ## 6. Everything the contract declares
 # MAGIC
 # MAGIC With no `checks=` argument, every check that applies to this frame and contract
-# MAGIC runs — here that adds `column_types` and the `row_count` assertion already in
-# MAGIC the YAML. `row_count` triggers a real `count()`, so keep it out of the loop on
-# MAGIC huge tables by passing `checks=["column_names"]`.
+# MAGIC runs — here that adds `column_types`, `allowed_values` on the site columns, and
+# MAGIC the `row_count` assertion already in the YAML. Both `row_count` and
+# MAGIC `allowed_values` read data (a `count()` and a `distinct()` per constrained column),
+# MAGIC so keep them out of the loop on huge tables by passing `checks=["column_names"]`.
 
 # COMMAND ----------
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 __all__ = ["FrameView", "view", "normalize_name"]
 
@@ -26,6 +26,16 @@ def normalize_name(name: str) -> str:
     return _NON_ALNUM.sub("_", str(name).strip().lower()).strip("_")
 
 
+def _is_missing(value: Any) -> bool:
+    """True for None, NaN and NaT -- everything that means "no value here"."""
+    if value is None:
+        return True
+    try:
+        return bool(value != value)  # only NaN/NaT are unequal to themselves
+    except Exception:  # pragma: no cover - exotic value types
+        return False
+
+
 @dataclass(frozen=True)
 class FrameView:
     """Uniform read-only view of a frame's schema."""
@@ -34,6 +44,7 @@ class FrameView:
     dtypes: Dict[str, str]
     kind: str
     _row_count: Optional[Callable[[], int]] = None
+    _distinct: Optional[Callable[[str, int], Sequence[Any]]] = None
 
     @property
     def has_types(self) -> bool:
@@ -43,26 +54,69 @@ class FrameView:
     def can_count_rows(self) -> bool:
         return self._row_count is not None
 
+    @property
+    def can_read_values(self) -> bool:
+        """True when the frame carries data, not just a schema."""
+        return self._distinct is not None
+
     def row_count(self) -> int:
         if self._row_count is None:
             raise TypeError("cannot count rows on a {0} frame".format(self.kind))
         return self._row_count()
 
+    def distinct_values(self, column: str, limit: int) -> Tuple[Any, ...]:
+        """Up to ``limit`` distinct values of ``column``, in no particular order.
+
+        Reads data. ``None``, ``NaN`` and ``NaT`` all come back as ``None`` so a
+        caller compares against one spelling of "missing".
+        """
+        if self._distinct is None:
+            raise TypeError("cannot read values from a {0} frame".format(self.kind))
+        if column not in self.columns:
+            raise KeyError("no column {0!r} in this {1} frame".format(column, self.kind))
+        if limit < 1:
+            raise ValueError("limit must be at least 1, got {0}".format(limit))
+
+        values: List[Any] = [
+            None if _is_missing(v) else v for v in self._distinct(column, int(limit))
+        ]
+        try:
+            return tuple(dict.fromkeys(values))  # order-preserving dedupe
+        except TypeError:  # pragma: no cover - unhashable values in the column
+            return tuple(values)
+
 
 def _spark_view(df: Any) -> FrameView:
     fields = df.schema.fields
+
+    def distinct(column: str, limit: int) -> Sequence[Any]:
+        # df[column], not df.select(column): a name with a space would otherwise
+        # be parsed as a SQL expression.
+        return [row[0] for row in df.select(df[column]).distinct().limit(limit).collect()]
+
     return FrameView(
         columns=tuple(f.name for f in fields),
         dtypes={f.name: f.dataType.simpleString() for f in fields},
         kind="spark",
         _row_count=df.count,
+        _distinct=distinct,
     )
 
 
 def _pandas_view(df: Any) -> FrameView:
     columns = tuple(str(c) for c in df.columns)
     dtypes = {str(c): str(dt) for c, dt in zip(df.columns, df.dtypes)}
-    return FrameView(columns=columns, dtypes=dtypes, kind="pandas", _row_count=lambda: len(df.index))
+
+    def distinct(column: str, limit: int) -> Sequence[Any]:
+        return list(df[column].drop_duplicates().head(limit))
+
+    return FrameView(
+        columns=columns,
+        dtypes=dtypes,
+        kind="pandas",
+        _row_count=lambda: len(df.index),
+        _distinct=distinct,
+    )
 
 
 def _names_view(names: Sequence[Any]) -> FrameView:

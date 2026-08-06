@@ -8,7 +8,7 @@ the code, and assert it from a notebook or job.
 ```python
 from dqspec import load_contract, validate_columns
 
-contract = load_contract("expected_columns.yaml")
+contract = load_contract("telemedicine.yaml")
 validate_columns(df, contract).raise_if_failed()
 ```
 
@@ -89,8 +89,11 @@ The contract YAML is package data, so it travels inside the wheel.
 ```yaml
 %YAML 1.2
 ---
-title: Expected Columns
+title: Telemedicine
 business_owner: TBD
+cadence: Monthly
+end_client: Internal        # or a list: [DMHC, CMS]
+report_type: Internal       # or a list: [QHP, HSD]
 assertions:
   row_count:
     greater_than: 100
@@ -102,16 +105,62 @@ columns:
     type: integer
     required: false
     description: Optional until the 2026 feed lands
+  - name: ANT
+    type: string
+    allowed_values: ["P", "C", "T", " "]
 ```
 
 `columns` also accepts the shorthand `columns: [PRACT ID, LAST NAME]` when you only
 care about names. Unknown top-level keys are preserved on `contract.raw`.
 
+`allowed_values` constrains the values a column may hold — see
+[Value constraints](#value-constraints) below.
+
+`cadence` records how often the dataset lands and is re-validated. It is optional, but
+when present it must be one of **Annual, Quarterly, Monthly, Weekly, Daily, Ad Hoc** —
+a closed vocabulary, exported as `dqspec.CADENCES`, so that an audit table can be
+grouped by it. Case and punctuation are forgiven and folded to the canonical spelling
+(`ad-hoc` → `Ad Hoc`); anything outside the list fails at load time:
+
+```
+telemedicine.yaml: unknown cadence 'Fortnightly'; expected one of Annual, Quarterly,
+Monthly, Weekly, Daily, Ad Hoc
+```
+
+It reaches Python as `contract.cadence`. Nothing validates *against* it — the data has
+no timestamp to compare with — so it is documentation the code can read, not an
+assertion.
+
+Two more closed vocabularies describe where the dataset goes:
+
+| key | Python | vocabulary |
+| --- | --- | --- |
+| `end_client` | `contract.end_clients` | **DMHC, DHCS, CMS, Internal** (`dqspec.END_CLIENTS`) — who receives it |
+| `report_type` | `contract.report_types` | **PAAS, QHP, TAR, AAR, HSD, Internal** (`dqspec.REPORT_TYPES`) — which programme it feeds |
+
+They are independent: the same report type can go to different clients, and one client
+receives several report types. A dataset can have more than one of either, so both keys
+take either form —
+
+```yaml
+end_client: DMHC                # one
+end_client: [DMHC, CMS]         # several
+report_type: [QHP, HSD]
+```
+
+— and both arrive as a tuple, so calling code never has to ask which spelling the YAML
+used. Unstated is `()`; an unknown value or a repeated one fails at load time.
+
+Together, `cadence`, `end_client` and `report_type` are what make an audit table worth
+keeping: stamp them onto your findings and "which of our monthly QHP feeds to DMHC
+failed validation this quarter?" becomes a `GROUP BY` rather than an archaeology
+project.
+
 Contracts are loaded with a strict YAML loader that **rejects duplicate keys**, since
 plain YAML would keep the last one and silently drop a column entry:
 
 ```
-expected_columns.yaml: duplicate key 'name' on line 4; YAML would silently keep only the last one
+telemedicine.yaml: duplicate key 'name' on line 4; YAML would silently keep only the last one
 ```
 
 Anchors and `<<:` merge keys still work — overriding a merged default is not a duplicate.
@@ -134,6 +183,38 @@ Options (keyword arguments to either function):
 | `normalize` | `False` | match names ignoring case/spaces/underscores (`PRACT ID` == `pract_id`) |
 | `check_order` | `False` | also warn when columns are not in contract order |
 | `strict_types` | `False` | type mismatches become errors instead of warnings |
+| `max_distinct_values` | `1000` | cap on distinct values `allowed_values` reads per column |
+
+### Value constraints
+
+A column with `allowed_values` may hold nothing else:
+
+```yaml
+  - name: ANT
+    type: string
+    allowed_values: ["P", "C", "T", " "]
+```
+
+The shipped `telemedicine.yaml` puts this on all 19 site columns (`ANT` … `WCR`),
+writing the list once with a YAML anchor (`&site_status`) and aliasing it on the rest
+so the sites cannot drift apart.
+
+```
+[ERROR] allowed_values: column 'SFO' holds 2 value(s) the contract does not allow:
+        'Z', 'p'; allowed: 'P', 'C', 'T', ' '
+```
+
+Worth knowing:
+
+- **Comparison is exact.** `'p'`, `'T '` and `''` are all violations when the list says
+  `'P'`, `'T'`, `' '`. That is the point — a single space and an empty string are
+  different values in the source system.
+- **Nulls are violations** unless the list includes `null`. A constrained column is one
+  that must be populated.
+- **It reads data** — one distinct scan per constrained column, so on Spark that is a
+  job each. `validate_columns()` and `checks=["column_names"]` still never touch data.
+- The scan stops at `max_distinct_values` and **warns** when it does, rather than
+  implying it saw everything.
 
 ### Results
 
@@ -194,7 +275,8 @@ pytest
   ``SELECT `PRACT ID` FROM ...``. Delta with column mapping disabled also rejects
   ` ,;{}()\n\t=` in column names on write. If you control the upstream, snake_case is
   less friction; if you do not, `normalize=True` bridges the two spellings.
-- **`row_count` costs a scan.** It calls `df.count()`. Use
+- **`row_count` and `allowed_values` cost a scan.** `row_count` calls `df.count()`;
+  `allowed_values` runs one `distinct()` per constrained column. Use
   `checks=["column_names"]` for the cheap schema-only path on large tables.
 - **`%pip install` must come before other imports** in a Databricks notebook, and is
   followed by `dbutils.library.restartPython()`.

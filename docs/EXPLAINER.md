@@ -18,19 +18,25 @@ reviewable, none survive the author leaving, and none can be read by a business 
 `dqspec` moves that knowledge into a YAML file that lives in git:
 
 ```yaml
-title: Expected Columns
+title: Telemedicine
 business_owner: TBD
+cadence: Monthly
+end_client: Internal
+report_type: Internal
 columns:
   - name: PRACT ID
     type: string
   - name: LAST NAME
     type: string
+  - name: ANT
+    type: string
+    allowed_values: ["P", "C", "T", " "]
 ```
 
 and gives you one line to enforce it:
 
 ```python
-validate_columns(df, load_contract("expected_columns.yaml")).raise_if_failed()
+validate_columns(df, load_contract("telemedicine.yaml")).raise_if_failed()
 ```
 
 The YAML is the contract. It goes through pull request review like any other change,
@@ -43,7 +49,7 @@ and a non-engineer can read it.
 Five modules, each with one job. Data flows left to right:
 
 ```
-  expected_columns.yaml
+  telemedicine.yaml
           |
           |  contract.py      parse + validate the YAML itself
           v
@@ -54,9 +60,9 @@ Five modules, each with one job. Data flows left to right:
       list of names)        │      │
           |                 │      │  column_names
           |  frames.py      │      │  column_types
-          v                 │      │  row_count
-      FrameView  ───────────┤      │
-   (columns, dtypes, kind)  │      v
+          v                 │      │  allowed_values
+      FrameView  ───────────┤      │  row_count
+   (columns, dtypes, kind)  │      │
                             └──> validate.py    pick applicable checks, run them
                                      │
                                      v
@@ -85,7 +91,9 @@ mapping — raises `ContractError` the moment you load it, naming the offending 
 
 ```
 columns[4] is missing the required key 'name'
-expected_columns.yaml: duplicate column 'DEGREE' at columns[3] and columns[11]
+telemedicine.yaml: duplicate column 'DEGREE' at columns[3] and columns[11]
+columns[9].allowed_values must be a list of scalars, got str
+telemedicine.yaml: unknown cadence 'Fortnightly'; expected one of Annual, Quarterly, ...
 ```
 
 The argument for this is narrower than "malformed input is bad", and worth stating
@@ -108,6 +116,37 @@ but a data contract that fails open produces *silence*, and silence is exactly w
 success looks like. The cost of being strict is a loud error on a file that was broken
 anyway. The cost of being lenient is undetectable.
 
+The same reasoning decides how the metadata fields are treated differently.
+`business_owner` is free text — a name, a team, a distribution list, `TBD` — because
+nothing downstream does anything with it but display it. The other three are **closed
+vocabularies**:
+
+| key | vocabulary | answers |
+| --- | --- | --- |
+| `cadence` | Annual, Quarterly, Monthly, Weekly, Daily, Ad Hoc | how often it lands |
+| `end_client` | DMHC, DHCS, CMS, Internal | who receives it |
+| `report_type` | PAAS, QHP, TAR, AAR, HSD, Internal | which programme it feeds |
+
+They are closed because the point of recording them is to group by them: "which of our
+monthly QHP feeds to DMHC failed validation this quarter?" is a question you can only
+ask if `Monthly`, `monthly` and `every month` are not three answers. So spelling and
+punctuation are forgiven and folded to the canonical form, and anything genuinely
+outside the list is rejected at load time rather than stored as free text that quietly
+splits a group in two. All three are optional — absent is `None` / `()`, not an error —
+because most of the value is in the contracts that do declare them.
+
+`end_client` and `report_type` are kept as two fields rather than one, because they vary
+independently: the same report type goes to different clients, and one client receives
+several report types. Folding them into a single "destination" field would make the
+combinations unrepresentable, and `Internal` — the one term that appears in both lists —
+would become ambiguous about which question it was answering.
+
+They differ from `cadence` in one way: a dataset has exactly one cadence, but can have
+several clients or report types, so those two keys accept `end_client: DMHC` or
+`end_client: [DMHC, CMS]`. The asymmetry is in the YAML only — both forms parse to a
+tuple, so no caller ever branches on which one the author wrote. The convenience is paid
+for once, in `_parse_terms`, rather than at every use site.
+
 ### The duplicate-key loader
 
 Structural strictness alone would not have been enough, because the likeliest way to
@@ -129,7 +168,7 @@ So `parse_contract` does not use `safe_load`. It uses `_StrictLoader`, a `SafeLo
 subclass whose mapping constructor rejects repeated keys:
 
 ```
-expected_columns.yaml: duplicate key 'name' on line 4; YAML would silently keep only the last one
+telemedicine.yaml: duplicate key 'name' on line 4; YAML would silently keep only the last one
 ```
 
 This applies to every mapping in the document, so a `row_count:` declared twice under
@@ -149,7 +188,7 @@ Three entry points:
 | `packaged_contract_path(name)` | when you need the file itself, not the parsed form |
 
 `load_contract` has one convenience worth knowing: a bare name with no directory
-component that does not exist on disk (`"expected_columns.yaml"`) is resolved against
+component that does not exist on disk (`"telemedicine.yaml"`) is resolved against
 the contracts packaged inside `dqspec`. An absolute path
 (`/Volumes/main/default/contracts/x.yaml`) is used as given. So the same call works
 whether the YAML ships in the wheel or lives on a Volume, and a typo produces a list of
@@ -161,7 +200,7 @@ key to the YAML never loses data, even before the code knows what the key means.
 ### `frames.py` — the adapter, and the reason there is no pyspark dependency
 
 `view(frame)` returns a `FrameView`: column names, a `{name: dtype}` map, a `kind`
-label, and an optional row-count callable.
+label, and two optional data-reading callables — a row count and a per-column distinct.
 
 It accepts a Spark DataFrame, a pandas DataFrame, or a plain list of column names, and
 it does so **without importing either library**. Dispatch is by shape:
@@ -191,9 +230,16 @@ legitimate call, so most of the tests are pure Python and run in a second. That 
 a testing hack — it is genuinely useful when you have a schema but no data, such as
 validating a contract against a table's metadata before the load runs.
 
-`FrameView` also reports what it *cannot* do. A bare list of column names has no dtypes
-and no row count, so `has_types` and `can_count_rows` are false. Section 4 explains why
-that matters.
+`FrameView` also reports what it *cannot* do. A bare list of column names has no dtypes,
+no row count and no values, so `has_types`, `can_count_rows` and `can_read_values` are
+all false. Section 4 explains why that matters.
+
+`distinct_values(column, limit)` is the one data-reading accessor. It keeps the engine
+difference inside `frames.py` — Spark does `df.select(df[col]).distinct().limit(n)`,
+pandas does `drop_duplicates().head(n)` — and normalises `None`, `NaN` and `NaT` to a
+single `None` on the way out, so a check compares against one spelling of "missing"
+rather than three. `df[col]` rather than `df.select(col)` is deliberate: a column named
+`PRACT ID` would otherwise be parsed by Spark as a SQL expression.
 
 ### `checks.py` — the registry
 
@@ -212,15 +258,28 @@ def check_row_count(frame, contract, options):
     yield Issue(check="row_count", severity=ERROR, ...)
 ```
 
-Three checks ship today. `column_names` is the one this project exists for;
-`column_types` and `row_count` are there to prove the extension point is real, and
-because your YAML already had a `row_count` assertion in it.
+Four checks ship today. `column_names` is the one this project exists for;
+`column_types`, `allowed_values` and `row_count` are there to prove the extension point
+is real, and because your YAML already had a `row_count` assertion in it.
+
+`allowed_values` is the first one that reads *values* rather than schema, and it is the
+template for anything row-level that follows: the constraint lives on the column entry
+in the YAML, the data access goes through `FrameView.distinct_values`, and the cost is
+declared in the docstring. Distinct-scanning is what makes it affordable — a status
+column has a handful of distinct values however many rows it has, so one `distinct()`
+per column answers the question without a per-row pass. The cap
+(`Options.max_distinct_values`, default 1000) is there for the case where someone puts
+the constraint on a high-cardinality column by mistake; hitting it emits a warning
+saying the scan was truncated, because a check that quietly examines part of a column
+and reports `PASS` is the failure mode this package exists to avoid.
 
 **The `applies` predicate is the important part.** It answers "is this check meaningful
 for this frame and this contract?" — separately from whether it passes. `row_count`
 applies only when the frame can be counted *and* the contract declares a `row_count`
 assertion. `column_types` applies only when the frame exposes dtypes *and* at least one
-column declares a `type`.
+column declares a `type`. `allowed_values` applies only when the frame carries data
+*and* at least one column declares the constraint — so it disappears entirely on the
+schema-only path.
 
 A check that does not apply is **skipped, not failed**. This is what lets `validate()`
 have no arguments beyond the frame and the contract: it runs everything that makes
@@ -291,6 +350,9 @@ What lands where:
 | optional column absent | warning | `required: false` said this was allowed |
 | type mismatch | warning by default | `strict_types=True` promotes it |
 | columns out of order | warning | order almost never breaks anything by name |
+| value outside `allowed_values` | error | the contract named the permitted values |
+| null in a constrained column | error | a constrained column is one that must be populated; list `null` to allow it |
+| `allowed_values` scan truncated | warning | the check is incomplete, not failed — and saying so beats a silent partial pass |
 | row count out of bounds | error | the assertion was explicit |
 
 The defaults are deliberately loose in one direction only. Things that are *definitely*
@@ -330,7 +392,7 @@ and carries an undeclared `SCRATCH_COL`.
 7. Four `Issue`s become a `ValidationResult`.
 
 ```
-Expected Columns: FAIL (2 error(s), 2 warning(s)) [checks: column_names]
+Telemedicine: FAIL (2 error(s), 2 warning(s)) [checks: column_names]
   [ERROR] column_names: missing required column 'PRACT ID' (did you mean 'pract_id'? -- set normalize=True to accept it)
   [ERROR] column_names: missing required column 'DEGREE'
   [WARNING] column_names: unexpected column 'pract_id' is not declared in the contract
@@ -409,7 +471,7 @@ The layout choice that makes B and C work is that **the contract YAML lives insi
 package**, at `src/dqspec/contracts/`, declared as `package-data` in `pyproject.toml`.
 A contracts directory at the repo root would work fine for A and then silently vanish
 from the wheel — you would install the code and no contracts. The built wheel contains
-`dqspec/contracts/expected_columns.yaml`; that is worth re-checking whenever a new
+`dqspec/contracts/telemedicine.yaml`; that is worth re-checking whenever a new
 contract is added.
 
 This is not the only sensible arrangement. Contracts in the package are
@@ -421,8 +483,13 @@ can be made per contract and changed later.
 
 ## 9. What it deliberately does not do
 
-- **No row-level validation.** Nothing checks individual values today. `row_count` is
-  the only assertion that reads data, and it only counts.
+- **No row-level reporting.** `allowed_values` reads values, but it reports the *set* of
+  disallowed values it found, not which rows carry them or how many. That is a
+  deliberate trade: a distinct scan is cheap and tells you what went wrong; counting or
+  locating offending rows is a second pass, and the fix is the same either way. If you
+  need the rows, filter on the reported values.
+- **No general row-level predicates.** There is no regex, range, uniqueness or
+  cross-column rule — `allowed_values` covers enumerations only.
 - **No contract generation.** There is no `infer_contract(df)`. A contract that was
   generated from the data asserts that the data looks like it did on the day you ran
   the generator, which is not an agreement anybody made.
@@ -450,14 +517,14 @@ Known limits, honestly:
 
 ## 10. Reading the source
 
-In dependency order, 712 lines including comments, docstrings and `__init__.py`:
+In dependency order, 1024 lines including comments, docstrings and `__init__.py`:
 
 | file | lines | read it for |
 | --- | --- | --- |
 | `results.py` | 89 | the vocabulary everything else emits |
-| `frames.py` | 79 | how Spark and pandas are unified |
-| `contract.py` | 184 | YAML parsing and its failure modes |
-| `checks.py` | 236 | the registry and the three checks |
+| `frames.py` | 123 | how Spark and pandas are unified |
+| `contract.py` | 378 | YAML parsing and its failure modes |
+| `checks.py` | 304 | the registry and the four checks |
 | `validate.py` | 66 | how they compose |
 
 `tests/test_validate.py` is the fastest way to see intended behaviour — every rule in

@@ -10,7 +10,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from .contract import Contract
 from .frames import FrameView, normalize_name
@@ -34,6 +45,9 @@ class Options:
 
     strict_types: bool = False
     """Type mismatches become errors instead of warnings."""
+
+    max_distinct_values: int = 1000
+    """Cap on the distinct values ``allowed_values`` reads per column."""
 
 
 CheckFn = Callable[[FrameView, Contract, Options], Iterable[Issue]]
@@ -236,6 +250,77 @@ def check_column_types(frame: FrameView, contract: Contract, options: Options) -
                 message="column {0!r} is {1}, contract expects {2}".format(
                     spec.name, actual_type, spec.type
                 ),
+            )
+
+
+# --------------------------------------------------------------------------
+# allowed_values -- the first check that reads values, not just the schema
+# --------------------------------------------------------------------------
+
+
+def _contract_constrains_values(frame: FrameView, contract: Contract) -> bool:
+    return frame.can_read_values and any(s.allowed_values is not None for s in contract.columns)
+
+
+def _show(value: Any) -> str:
+    return "null" if value is None else repr(value)
+
+
+def _join(values: Sequence[Any], cap: int = 10) -> str:
+    shown = ", ".join(_show(v) for v in values[:cap])
+    hidden = len(values) - cap
+    return shown if hidden <= 0 else "{0}, ... (+{1} more)".format(shown, hidden)
+
+
+@register("allowed_values", applies=_contract_constrains_values)
+def check_allowed_values(frame: FrameView, contract: Contract, options: Options) -> Iterator[Issue]:
+    """Every value in a column is one its ``allowed_values`` list permits.
+
+    NOTE: this reads data -- one distinct scan per constrained column, which on
+    Spark is a job each. Exclude it with
+    ``validate(df, contract, checks=["column_names"])`` when you only want the
+    schema checks.
+
+    Nulls (and NaN) are violations unless the contract lists ``null`` among the
+    allowed values, since a constrained column is one that must be populated.
+    """
+    limit = max(int(options.max_distinct_values), 1)
+    actual_by_key = {_key(c, options): c for c in frame.columns}
+
+    for spec in contract.columns:
+        if spec.allowed_values is None:
+            continue
+        actual_name = actual_by_key.get(_key(spec.name, options))
+        if actual_name is None:
+            continue  # already reported by column_names
+
+        # One over the cap, so a full page tells us the scan was truncated.
+        found = frame.distinct_values(actual_name, limit + 1)
+        truncated = len(found) > limit
+        offenders = [v for v in found[:limit] if v not in spec.allowed_values]
+
+        if offenders:
+            yield Issue(
+                check="allowed_values",
+                severity=ERROR,
+                column=spec.name,
+                expected=_join(spec.allowed_values),
+                actual=_join(offenders),
+                message="column {0!r} holds {1} value(s) the contract does not allow: "
+                "{2}; allowed: {3}".format(
+                    spec.name, len(offenders), _join(offenders), _join(spec.allowed_values)
+                ),
+            )
+
+        if truncated:
+            yield Issue(
+                check="allowed_values",
+                severity=WARNING,
+                column=spec.name,
+                expected="at most {0} distinct values".format(limit),
+                actual="more than {0}".format(limit),
+                message="only the first {0} distinct values of {1!r} were checked; raise "
+                "max_distinct_values to widen the scan".format(limit, spec.name),
             )
 
 

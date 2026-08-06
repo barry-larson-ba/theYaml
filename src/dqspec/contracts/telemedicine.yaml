@@ -1,0 +1,96 @@
+%YAML 1.2
+---
+title: Telemedicine
+business_owner: TBD
+# How often this dataset lands and is re-validated.
+# One of: Annual, Quarterly, Monthly, Weekly, Daily, Ad Hoc
+cadence: Monthly
+# Who receives the dataset. One value, or a list of them.
+# One of: DMHC, DHCS, CMS, Internal
+end_client: Internal
+# Which reporting programme it feeds. One value, or a list of them.
+# One of: PAAS, QHP, TAR, AAR, HSD, Internal
+report_type: Internal
+assertions:
+  row_count:
+    greater_than: 100
+    less_than: 1000000
+columns:
+  - name: PRACT ID
+    type: string
+  - name: LAST NAME
+    type: string
+  - name: FIRST NAME
+    type: string
+  - name: MIDDLE INITIAL
+    type: string
+  - name: DEGREE
+    type: string
+  - name: PRIMARY FACILITY
+    type: string
+  - name: HOME PRIVILEGE 1
+    type: string
+  - name: HOME PRIVILEGE 2
+    type: string
+  - name: TELEMEDICINE PROGRAM 1
+    type: string
+  # Site columns. Every one holds P, C, T, or a single space -- nothing else.
+  # The list is written once and aliased (*site_status) so the 19 sites cannot
+  # drift apart; edit it here and every site column follows.
+  - name: ANT
+    type: string
+    allowed_values: &site_status ["P", "C", "T", " "]
+  - name: FRE
+    type: string
+    allowed_values: *site_status
+  - name: FRS
+    type: string
+    allowed_values: *site_status
+  - name: MAN
+    type: string
+    allowed_values: *site_status
+  - name: OAK
+    type: string
+    allowed_values: *site_status
+  - name: ROS
+    type: string
+    allowed_values: *site_status
+  - name: RWC
+    type: string
+    allowed_values: *site_status
+  - name: SAC
+    type: string
+    allowed_values: *site_status
+  - name: SCL
+    type: string
+    allowed_values: *site_status
+  - name: SFO
+    type: string
+    allowed_values: *site_status
+  - name: SJO
+    type: string
+    allowed_values: *site_status
+  - name: SLN
+    type: string
+    allowed_values: *site_status
+  - name: SRF
+    type: string
+    allowed_values: *site_status
+  - name: SRO
+    type: string
+    allowed_values: *site_status
+  - name: SSC
+    type: string
+    allowed_values: *site_status
+  - name: SSF
+    type: string
+    allowed_values: *site_status
+  - name: VAC
+    type: string
+    allowed_values: *site_status
+  - name: VAL
+    type: string
+    allowed_values: *site_status
+  - name: WCR
+    type: string
+    allowed_values: *site_status
